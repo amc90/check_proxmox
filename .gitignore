@@ -1,0 +1,11 @@
+syntax: glob
+
+#Typical temp files:
+.*.swp
+.*.swo
+**~
+**\#*\#
+**\#.*
+**.\#*
+**.orig
+

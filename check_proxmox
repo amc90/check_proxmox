@@ -1,0 +1,270 @@
+#!/usr/bin/perl -w
+
+use strict;
+use Net::Proxmox::VE;
+use Getopt::Long;
+use Data::Printer;
+use IO::Socket::SSL qw(SSL_VERIFY_NONE);
+use Text::Glob;
+
+use constant {OK=>0, WARNING=>1, CRITICAL=>2, UNKNOWN=>3};
+use constant STATUSES => qw(OK WARNING CRITICAL UNKNOWN);
+
+#NOTE: Since this is probably getting run with Nagios's ePN we want to be careful with global lexicals.
+#Its likely to be safe as long as we consider them read-only.
+
+my %resource_modes=(
+	"node"=>{
+		"help"=>"Checks proxmox node status. No ID used.",
+		"perfdata"=>{
+			"cpu"=>      "",
+			"disk"=>     "B",
+			"mem"=>      "B",
+			"uptime"=>   "s",
+		},
+		"name"=>sub(){shift->{"node"}},
+	},
+	"qemu"=>{
+		"help"=>"Checks qemu VM instances. IDs look like 'qemu/123'",
+		"perfdata"=>{
+			"cpu"=>      "",
+			"disk"=>     "B",
+			"diskread"=> "",
+			"diskwrite"=>"",
+			"mem"=>      "B",
+			"uptime"=>   "s",
+			"netin"=>    "",
+			"netout"=>   "",
+		},
+		"name"=>"name",
+		"name"=>sub(){my $h=shift; "$h->{node}.$h->{name}"},
+	},
+	"storage"=>{
+		"help"=>"Checks storage instances. IDs look like 'storage/mynode/storagename'",
+		"perfdata"=>{
+			"disk"=>     "B",
+		},
+		"name"=>"name",
+		"name"=>sub(){my $h=shift; "$h->{node}.$h->{storage}"},
+	},
+	"lxc"=>{
+		"help"=>"Check lxc instances. IDs look like 'lxc/123'",
+		"perfdata"=>{
+			"cpu"=>      "",
+			"disk"=>     "B",
+			"diskread"=> "",
+			"diskwrite"=>"",
+			"mem"=>      "B",
+			"uptime"=>   "s",
+			"netin"=>    "",
+			"netout"=>   "",
+		},
+		"name"=>sub(){shift->{"name"}},
+	},
+);
+
+my %special_modes=(
+	"status"=>{
+		"help"=>"Checks cluster node status",
+		"fn"=>sub{
+			my ($proxmox, $SAY, $END, $_opts)=@_;
+			my %opts=%$_opts;
+
+			my @obs=filter_obs("", $proxmox->get('/cluster/status'));
+			p @obs if $opts{verbose};
+			for my $cluster (filter_obs("id=cluster", @obs)) {
+				#my @cluster=%$cluster_ref;
+				if($cluster->{quorate}) {
+					$SAY->(OK, "Cluster $cluster->{name} is quorate", "Cluster $cluster->{name} is quorate. Nodes: $cluster->{nodes}");
+				} else {
+					$SAY->(CRITICAL, "Cluster $cluster->{name} not quorate", "Cluster $cluster->{name} not quorate! Nodes: $cluster->{nodes}");
+				}
+				$SAY->(undef, undef, undef, "nodes=$cluster->{nodes}");
+			}
+			for my $node (filter_obs("id=node/*", @obs)) {
+				if(!$node->{online}) {
+					$SAY->(WARNING, "Node $node->{name} is not online", "Node $node->{name}, $node->{ip} is not online! nodeid: $node->{nodeid}");
+				}
+			}
+		},
+	},
+);
+my %all_modes=(%resource_modes, %special_modes);
+
+my %opt_desc=(
+	#multi indicates multiple possible values.
+	#Only arguments with a validation function may take a parameter.
+	host     =>{short=>"H",help=>"Connect to proxmox on the given host",
+	            multi=>1,    valid=>sub{$_[0]=~qr/^[-+=_*&^%!~#:;?.,|[:alnum:]]+$/}},
+	password =>{short=>"P",help=>"Password to use",
+	            multi=>0,    valid=>sub{$_[0]=~qr/^[-+=_*&^%!~#:;?.,| [:alnum:]]+$/}},
+	username =>{short=>"u",help=>"Username to use",default=>"root",
+	            multi=>0,    valid=>sub{$_[0]=~qr/^[-_.[:alnum:]]+$/}},
+	port     =>{short=>"p",help=>"Port to connect to",default=>"8006",
+	            multi=>0,    valid=>sub{$_[0]=~qr/^[-_[:alnum:]]+$/}},
+	realm    =>{short=>"r",help=>"Realm to connect with",default=>"pam",
+	            multi=>0,    valid=>sub{$_[0]=~qr/^[[:alnum:]]+$/}},
+	mode     =>{short=>"m",help=>"One of: ".join("|",keys(%all_modes))." (see below)",default=>"pam",
+	            multi=>0,    valid=>sub{grep {$_[0] eq $_} keys(%all_modes) }},
+	insecure =>{short=>"i",help=>"Disable SSL host verification",flag=>1},
+	help     =>{short=>"h",help=>"Display this message",flag=>1},
+	debug    =>{short=>"d",help=>"Output debugging information",flag=>1},
+	verbose  =>{short=>"v",help=>"Display fields on stderr for each object this mode uses",flag=>1},
+);
+
+my @optspec=map {my %v=%{$opt_desc{$_}};"$_|".$v{short}.($v{valid}?'=s':"").($v{multi}?'@':"")} keys(%opt_desc);
+my @required_opts=(grep {!$opt_desc{$_}->{flag}} keys(%opt_desc));
+
+sub opt_help {
+	my $filter=pop;
+	my @filtered=grep $filter->(), keys(%opt_desc);
+	join("\n",map {
+		my %v=%{$opt_desc{$_}};
+		my $args=$v{valid}?"$_=<".($v{default}||"...").">":"$_";
+		my $extra=$v{multi}?sprintf("\n%25s %s", "", "(may be specified multiple times)"):"";
+		sprintf("   -%s --%-15s %s%s", $v{short}, $args, $v{help}, $extra)} sort @filtered);
+}
+
+sub dieusage {
+	print STDERR "ERROR: ".shift."\n" while @_;
+	print STDERR <<"EOF";
+usage: $0 <options>
+
+ Mandatory options:
+${\opt_help( sub{!$opt_desc{$_}->{flag} and !$opt_desc{$_}->{default}} ) }
+
+ Optional options:
+${\opt_help( sub{!$opt_desc{$_}->{flag} and $opt_desc{$_}->{default}} ) }
+
+ Flags:
+${\opt_help( sub{$opt_desc{$_}->{flag}} ) }
+
+ Modes:
+${\join("\n", map {sprintf("%15s - %s", $_, $all_modes{$_}->{"help"})} keys(%all_modes) )}
+
+ Expressions:
+   Expressions are a space separated list of pairs. Each pair much match for 
+   the entire expression to match. The pair looks like either <key>=<value> or
+   <key>!=<value>, and they support glob syntax. Missing keys are considered 
+   to be an empty string. Thus "id=node/* ip!=10.20.30.*" matches any only 
+   entries beginning with "node/" AND with either no ip entry, or one that 
+   isn't 10.20.30.*
+
+
+EOF
+	exit 1;
+}
+
+
+sub handle_opts {
+	my %opts=map {my $d=$opt_desc{$_}->{default}; $d?($_=>$d):()} keys(%opt_desc);
+	Getopt::Long::config(qw(no_ignore_case));
+	GetOptions(\%opts, @optspec) || dieusage "Malformed options: ". np %opts;
+	dieusage if $opts{help};
+	my @missing_opts=grep {!$opts{$_}} @required_opts;
+	dieusage("Missing expected opts: --".join(" --", @missing_opts)) if @missing_opts;
+	my @malformed_opts=grep {
+		my $fn=$opt_desc{$_}->{valid};
+		my @vals=$opt_desc{$_}->{multi}? @{$opts{$_}} : $opts{$_} ;
+		my @test=( 1 );
+		$fn and grep { !$fn->($_) } @vals;
+		} keys(%opts);
+	dieusage("Malformed options: --".join(" --", @malformed_opts)) if @malformed_opts;
+	p %opts if $opts{debug};
+	return %opts;
+}
+
+#Argument 1 is an expression. The remaining value is a hash. Return whether the hash matches the expression.
+sub match {
+	my $e=shift;
+	my %h=@_;
+	foreach my $part (split(/ /, $e, 2)) {
+		$part=~/^([^=!]+)(!?=)(.*)$/ or die "Bad pattern to match($part)";
+		return 0 if(Text::Glob::match_glob($3, $h{$1}||"") xor ($2 eq "=") );
+	}
+	return 1;
+}
+
+#Argument 1 match expression (above). Return each subsequent matching hash in order
+sub filter_obs {
+	my $m=shift;
+	return grep { match($m, %{$_})} @_;
+}
+
+sub main {
+	my %opts=handle_opts;
+	my $status=OK;
+	my @short=();
+	my @long=();
+	my @perfdat=();
+	my $SAY=sub {
+		my($_status, $_short, $_long, $_perfdat)=@_;
+		$status=$_status if($_status and $_status>$status);
+		push @short, $_short||();
+		push @long, $_long||();
+		push @perfdat, $_perfdat||();
+	};
+	my $END=sub {
+		$SAY->(@_);
+		printf("Proxmox %s: %s |%s\n", (STATUSES)[$status], join(". ",@short), join(" ",@perfdat));
+		print((join "\n", @long)."\n") if @long;
+		exit $status;
+	};
+	my $proxmox;
+	AHOST:while(my $ahost = shift @{$opts{host}}) {
+		$proxmox=Net::Proxmox::VE->new(
+			host => $ahost,
+			password => $opts{password},
+			username => $opts{username},
+			port => $opts{port},
+			realm => $opts{realm},
+			debug => $opts{debug},
+			$opts{insecure}?(ssl_opts => {
+				SSL_verify_mode => SSL_VERIFY_NONE,
+				verify_hostname => 0
+			}):()
+		);
+		unless($proxmox->login()) {
+			$SAY->(WARNING, "DOWN:".$ahost, "Failed to login to $ahost: $!");
+			next AHOST;
+		}
+		unless($proxmox->check_login_ticket()) {
+			$SAY->(WARNING, "DOWN:".$ahost, "Login ticket appears to be invalid: $!");
+			next AHOST;
+		}
+		$SAY->(undef, $ahost, "Connected to ".$ahost." API=".$proxmox->api_version()->{version});
+	}
+	$END->(UNKNOWN, "Failed connection", "Failed to find a suitable server to connect to") unless $proxmox->check_login_ticket();
+	p $proxmox if $opts{debug};
+
+	if($special_modes{$opts{mode}}) {
+		$special_modes{$opts{mode}}->{fn}->($proxmox, $SAY, $END, \%opts);
+	} elsif ($resource_modes{$opts{mode}}) {
+		my $modeinfo=$resource_modes{$opts{mode}};
+		my @obs=filter_obs("type=$opts{mode}", $proxmox->get('/cluster/resources'));
+		for my $ob (@obs) {
+			for my $perffield (sort keys(%{$modeinfo->{perfdata}})) {
+				$ob->{"-${perffield}warn"}=""  unless $ob->{"-${perffield}warn"};
+				$ob->{"-${perffield}crit"}=""  unless $ob->{"-${perffield}crit"};
+				$ob->{"-${perffield}min" }="0" unless $ob->{"-${perffield}min"};
+				$ob->{"-${perffield}max" }=""  unless $ob->{"-${perffield}max"};
+			}
+		}
+		p @obs if $opts{verbose};
+		for my $ob (@obs) {
+			my $name=$modeinfo->{name}->($ob);
+			for my $perffield (sort keys(%{$modeinfo->{perfdata}})) {
+				$SAY->(undef, undef, undef, sprintf("%s.%s=%s%s;%s;%s;%s;%s", $name, $perffield, $ob->{$perffield}, $modeinfo->{perfdata}{$perffield}, $ob->{"-${perffield}warn"}, $ob->{"-${perffield}crit"}, $ob->{"-${perffield}min"}, $ob->{"-${perffield}max"}));
+			}
+		}
+	} else {
+	#/cluster/ha/status/current returns array of hashes. We want element with id=quorum.
+	#/cluster/resources is probably what we are mostly interested in.
+	#/cluster/status
+	#p $proxmox->get('/cluster/ha/status/current');
+		$END->(UNKNOWN, "Unrecognised check mode");
+	}
+	$END->();
+}
+
+main();
