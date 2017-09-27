@@ -98,8 +98,8 @@ my %opt_desc=(
 	#Only arguments with a validation function may take a parameter.
 	config   =>{short=>"c",req=>0,help=>"Read the given file. Each line contains a long option without minuses, then optionally a single space, followed by the value of the option.",
 	            multi=>1,    valid=>sub{1}},
-	host     =>{short=>"H",req=>1,help=>"Connect to proxmox on the given host",
-	            multi=>1,    valid=>sub{$_[0]=~qr/^[-+=_*&^%!~#:;?.,|[:alnum:]]+$/}},
+	host     =>{short=>"H",req=>1,help=>"Connect to proxmox on the given host (multiple hosts can be space separated in one argument)",
+	            multi=>1,    valid=>sub{$_[0]=~qr/^[-+=_*&^%!~#:;?.,|[:alnum:]]+( *[-+=_*&^%!~#:;?.,|[:alnum:]]+)*$/}},
 	password =>{short=>"P",req=>1,help=>"Password to use",
 	            multi=>0,    valid=>sub{$_[0]=~qr/^[-+=_*&^%!~#:;?.,| [:alnum:]]+$/}},
 	username =>{short=>"u",req=>0,help=>"Username to use",default=>"root",
@@ -178,6 +178,8 @@ sub handle_opts {
 	my %opts=map {my $d=$opt_desc{$_}->{default}; $d?($_=>$d):()} keys(%opt_desc);
 	Getopt::Long::config(qw(no_ignore_case));
 	GetOptions(\%opts, @optspec) || dieusage "Malformed options: ". np %opts;
+
+	#Add any config files to the options
 	for my $config (@{$opts{config}}) {
 		open(my $f, $config) || dieusage "Failed to open $config";
 		foreach (<$f>) {
@@ -188,6 +190,11 @@ sub handle_opts {
 		}
 	}
 	dieusage if $opts{help};
+
+	#Special case for host with spaces in it.
+	$opts{host}=[grep /./, (map {split / +/} @{$opts{host}})];
+
+	#Handle issues with the options
 	my @missing_opts=grep {!$opts{$_}} @required_opts;
 	dieusage("Missing expected opts: --".join(" --", @missing_opts)) if @missing_opts;
 	my @malformed_opts=grep {
