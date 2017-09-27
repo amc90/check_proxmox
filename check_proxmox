@@ -276,6 +276,7 @@ sub main {
 			next AHOST;
 		}
 		$SAY->(undef, "$opts{mode} mode", "Connected to ".$ahost." API=".$proxmox->api_version()->{version});
+		last AHOST;
 	}
 	$END->(UNKNOWN, "Failed connection", "Failed to find a suitable server to connect to") unless $proxmox->check_login_ticket();
 	p $proxmox if $opts{debug};
